@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceRoute, TraceSink, outcome,
+    usage_source,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
@@ -130,12 +131,52 @@ pub(crate) struct RequestTracer {
     ts: String,
     key_id: u64,
     key_source: TraceKeySource,
+    client_ip: Option<String>,
     model: String,
     is_stream: bool,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
+    /// 「是否沿用了上一轮账号」只看第一次。
+    route: parking_lot::Mutex<Option<TraceRoute>>,
+}
+
+/// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum UsageSource {
+    /// 错误早退等无用量场景
+    #[default]
+    Unknown,
+    /// 上游 metadataEvent.tokenUsage
+    Provider,
+    /// 本地 CacheMeter 按断点估算
+    Simulated,
+    /// 无断点 / 计量关闭
+    None,
+}
+
+impl UsageSource {
+    fn as_db(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => Option::None,
+            Self::Provider => Some(usage_source::PROVIDER),
+            Self::Simulated => Some(usage_source::SIMULATED),
+            Self::None => Some(usage_source::NONE),
+        }
+    }
+
+    /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
+    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+        if has_provider_usage {
+            Self::Provider
+        } else if cache_usage.cache_covered_est > 0 {
+            Self::Simulated
+        } else {
+            Self::None
+        }
+    }
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -146,6 +187,7 @@ pub(crate) struct TraceUsage {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    pub source: UsageSource,
 }
 
 impl TraceUsage {
@@ -169,11 +211,13 @@ impl RequestTracer {
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
+            client_ip: options.key_ctx.client_ip,
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         }
     }
 
@@ -205,6 +249,7 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let route = self.route.lock().take();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -225,6 +270,11 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            session_id: route.as_ref().and_then(|r| r.session_id.clone()),
+            sticky_outcome: route.as_ref().map(|r| r.sticky_outcome.to_string()),
+            previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
+            usage_source: usage.source.as_db().map(|s| s.to_string()),
+            client_ip: self.client_ip.clone(),
             attempts,
         };
         store.insert(&rec);
@@ -239,6 +289,13 @@ impl TraceSink for RequestTracer {
         // before persisting to the (trace_id, attempt) primary key.
         attempt.attempt = attempts.len() as u32;
         attempts.push(attempt);
+    }
+
+    fn on_route(&self, route: TraceRoute) {
+        let mut slot = self.route.lock();
+        if slot.is_none() {
+            *slot = Some(route);
+        }
     }
 }
 
@@ -1138,6 +1195,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
+        source: UsageSource::resolve(ctx.provider_token_usage.is_some(), &ctx.cache_usage),
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1359,6 +1417,7 @@ async fn handle_non_stream_request(
                 } else {
                     0.0
                 },
+                source: UsageSource::Provider,
             };
             hook.record(
                 credential_id,
@@ -1472,6 +1531,7 @@ async fn handle_non_stream_request(
             } else {
                 0.0
             },
+            source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1981,6 +2041,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -2001,6 +2062,7 @@ fn create_buffered_sse_stream(
                                     cache_creation_tokens: cc.max(0) as u64,
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
                                 };
                                 if let Some(message) = ctx.tool_json_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
@@ -2051,6 +2113,7 @@ mod tests {
                     key_id: 0,
                     group: None,
                     key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
@@ -2089,11 +2152,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 7,
             key_source: TraceKeySource::ClientKey,
+            client_ip: None,
             model: "gpt-5.6-luna".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2121,6 +2186,7 @@ mod tests {
                 cache_creation_tokens: 7,
                 cache_read_tokens: 89,
                 credits: 0.25,
+                source: UsageSource::Simulated,
             },
         );
 
@@ -2157,11 +2223,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
 
         tracer.mark_first_token();
@@ -2187,11 +2255,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: true,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2490,7 +2560,6 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
-            effective_discount_ratio: 0.1,
         };
         let provider = TokenUsage {
             uncached_input_tokens: 3,
@@ -2511,7 +2580,6 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
-            effective_discount_ratio: 0.1,
         };
 
         assert_eq!(

@@ -4,13 +4,20 @@ import { Cpu, Bot, Sparkles, Wrench, Plus, Trash2, Save, Loader2, AlertCircle } 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { SettingGroup, SettingSwitch, SettingNumber, useFieldSaver } from '@/components/console/setting-row'
+import {
+  SettingGroup,
+  SettingSwitch,
+  SettingNumber,
+  useFieldSaver,
+} from '@/components/console/setting-row'
 import {
   useCustomModels,
   useSetCustomModels,
   useCurrentCredentialModels,
   useCacheMeteringConfig,
   useSetCacheMeteringConfig,
+  useSessionAffinityConfig,
+  useSetSessionAffinityConfig,
 } from '@/hooks/use-credentials'
 import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
@@ -90,7 +97,16 @@ export function ModelsSection() {
   const { mutate: mutateCacheMetering } = useSetCacheMeteringConfig()
   const cacheSaver = useFieldSaver(mutateCacheMetering, reportSaveError)
   const cacheMeteringEnabled = cacheMetering?.enabled ?? true
-  const cacheDiscountRatio = cacheMetering?.effectiveDiscountRatio ?? 0.6
+
+  // 会话粘性路由
+  const { data: affinity, isLoading: affinityLoading } = useSessionAffinityConfig()
+  const { mutate: mutateAffinity } = useSetSessionAffinityConfig()
+  const affinitySaver = useFieldSaver(mutateAffinity, reportSaveError)
+  const affinityEnabled = affinity?.enabled ?? true
+  const affinityTtlSecs = affinity?.ttlSecs ?? 3600
+  const affinityTotal = (affinity?.hits ?? 0) + (affinity?.misses ?? 0)
+  const affinityHitPct =
+    affinityTotal > 0 ? ((affinity!.hits / affinityTotal) * 100).toFixed(1) : null
 
   // 上游模型
   const upstreamQuery = useCurrentCredentialModels(vendor !== 'custom')
@@ -192,13 +208,13 @@ export function ModelsSection() {
     <div className="space-y-6">
       <SettingGroup
         title="Prompt Cache 提示词缓存"
-        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量与下游计费对齐"
+        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"
       >
         <SettingSwitch
           label="模拟 prompt cache 计量"
           hint={
             cacheMeteringEnabled
-              ? '按客户端声明的 cache_control 断点估算缓存读取与创建；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
+              ? '按客户端声明的 cache_control 断点估算缓存读取与创建，如实上报命中量；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
               : '输入 Token 全额计入 input tokens，缓存两项恒为 0；彻底关闭缓存计量模拟'
           }
           checked={cacheMeteringEnabled}
@@ -207,23 +223,42 @@ export function ModelsSection() {
           saved={cacheSaver.isSaved('cacheMetering')}
           disabled={cacheLoading}
         />
-        {cacheMeteringEnabled && (
+      </SettingGroup>
+
+      <SettingGroup
+        title="会话粘性路由"
+        description="开启后同一会话的后续轮次优先沿用上一轮成功的账号；该账号不可用时才回落到负载均衡。上游 prompt cache 按 profile 隔离：账号同属一个 profile 时换号不丢缓存（凭据页顶部有标记），跨 profile 部署时粘性才真正保住缓存。"
+      >
+        <SettingSwitch
+          label="同一会话优先沿用上一轮账号"
+          hint={
+            affinityEnabled
+              ? affinityHitPct != null
+                ? `运行以来粘性命中率 ${affinityHitPct}%（命中 ${affinity!.hits} / 未命中 ${affinity!.misses}），当前有效绑定 ${affinity!.activeBindings} 个会话。请求日志里可按「仅换号」筛出未沿用的轮次。`
+                : '尚无统计。粘性优先于 priority 模式的「高优先级恢复后立即回切」；会话在有效期内不会主动迁回高优先级账号。'
+              : '每轮独立按负载均衡选号；多账号下同一会话大概率在账号间跳转，上游缓存难以复用。'
+          }
+          checked={affinityEnabled}
+          onChange={(next) => affinitySaver.save('affinityEnabled', { enabled: next })}
+          pending={affinitySaver.isSaving('affinityEnabled')}
+          saved={affinitySaver.isSaved('affinityEnabled')}
+          disabled={affinityLoading}
+        />
+        {affinityEnabled && (
           <SettingNumber
-            label="实际成本折算率（对齐下游计费）"
-            hint="下游中转站（如 NewAPI）见到缓存读取会自动强制按 1 折（0.1x）扣费。由于上游长对话平均成本约为 6 折（0.6x），本程序会自动将多出的缓存读等价转换为普通输入，使得下游按 0.1x 计算后的总扣费精确等于设定成本，防止站长倒贴亏损。"
-            value={cacheDiscountRatio}
-            min={10}
-            max={100}
-            unit="%"
-            toDisplay={(v) => Math.round(v * 100)}
-            fromDisplay={(v) => Number((v / 100).toFixed(2))}
-            presets={[10, 60, 100]}
-            onCommit={(next) =>
-              cacheSaver.save('discountRatio', { effectiveDiscountRatio: next })
-            }
-            pending={cacheSaver.isSaving('discountRatio')}
-            saved={cacheSaver.isSaved('discountRatio')}
-            disabled={cacheLoading}
+            label="绑定有效期"
+            hint="会话与账号绑定的保留时长，每次成功请求都会续期。与上游缓存 TTL 量级对齐即可，过长会让长会话一直占着某个账号。"
+            value={affinityTtlSecs}
+            min={1}
+            max={1440}
+            unit="分钟"
+            toDisplay={(v) => Math.round(v / 60)}
+            fromDisplay={(v) => v * 60}
+            presets={[5, 60, 240]}
+            onCommit={(next) => affinitySaver.save('affinityTtl', { ttlSecs: next })}
+            pending={affinitySaver.isSaving('affinityTtl')}
+            saved={affinitySaver.isSaved('affinityTtl')}
+            disabled={affinityLoading}
           />
         )}
       </SettingGroup>

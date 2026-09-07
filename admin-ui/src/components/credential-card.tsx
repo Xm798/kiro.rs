@@ -177,6 +177,12 @@ function endpointDisplayLabel(endpoint: string): string {
   return endpoint;
 }
 
+/** Profile ARN 的短标识：`arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK` → `EHGA3GRVQMUK` */
+export function profileShortId(arn: string): string {
+  const idx = arn.lastIndexOf("/");
+  return idx >= 0 ? arn.slice(idx + 1) : arn;
+}
+
 function metadataValueLabel(value: unknown): string {
   if (typeof value === "boolean") return value ? "是" : "否";
   if (typeof value === "string" || typeof value === "number") {
@@ -1396,8 +1402,17 @@ function CredentialCardImpl({
                     </LedgerRow>
                   )}
                   {credential.hasProfileArn && (
-                    <LedgerRow label="Profile ARN" icon={Layers}>
-                      <span className="text-emerald-600 dark:text-emerald-400">已配置</span>
+                    <LedgerRow label="Profile" icon={Layers}>
+                      <span
+                        className="font-mono text-xs"
+                        title={
+                          credential.profileArn
+                            ? `${credential.profileArn}\n上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                            : "已配置"
+                        }
+                      >
+                        {credential.profileArn ? profileShortId(credential.profileArn) : "已配置"}
+                      </span>
                     </LedgerRow>
                   )}
                   {credential.sourceChannel && (

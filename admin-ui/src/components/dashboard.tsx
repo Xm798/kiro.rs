@@ -77,7 +77,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { CredentialCard } from "@/components/credential-card";
+import { CredentialCard, profileShortId } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -346,6 +346,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const allCredentials = import.meta.env.DEV
     ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
     : (data?.credentials ?? []);
+
+  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
+  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
+  const profileSummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of allCredentials) {
+      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [allCredentials]);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -1491,9 +1501,32 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           title="凭据管理"
           description="上游提供商凭据集群、配额健康度与多通道负载均衡管理。"
           badge={
-            <Badge variant="secondary" className="font-mono text-xs">
-              {allCredentials.length} 个凭据
-            </Badge>
+            <span className="inline-flex items-center gap-1.5">
+              <Badge variant="secondary" className="font-mono text-xs">
+                {allCredentials.length} 个凭据
+              </Badge>
+              {profileSummary.length > 0 && (
+                <Badge
+                  variant="outline"
+                  className={`font-mono text-xs ${
+                    profileSummary.length === 1
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                      : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                  }`}
+                  title={
+                    profileSummary.length === 1
+                      ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                      : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
+                          .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
+                          .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
+                  }
+                >
+                  {profileSummary.length === 1
+                    ? `同一 profile · 缓存共享`
+                    : `${profileSummary.length} 个 profile`}
+                </Badge>
+              )}
+            </span>
           }
         />
 

@@ -541,7 +541,29 @@ export async function setLogGovernanceConfig(
 
 export interface CacheMeteringConfig {
   enabled: boolean
-  effectiveDiscountRatio: number
+}
+
+/** 会话粘性路由配置 + 运行时统计 */
+export interface SessionAffinityConfig {
+  enabled: boolean
+  ttlSecs: number
+  /** 进程启动以来的粘性命中 / 未命中次数（关闭期间不计） */
+  hits: number
+  misses: number
+  /** 当前未过期的会话绑定数 */
+  activeBindings: number
+}
+
+export async function getSessionAffinityConfig(): Promise<SessionAffinityConfig> {
+  const { data } = await api.get<SessionAffinityConfig>('/config/session-affinity')
+  return data
+}
+
+export async function setSessionAffinityConfig(
+  patch: Partial<Pick<SessionAffinityConfig, 'enabled' | 'ttlSecs'>>,
+): Promise<SessionAffinityConfig> {
+  const { data } = await api.put<SessionAffinityConfig>('/config/session-affinity', patch)
+  return data
 }
 
 // 获取 prompt cache 计量模拟开关

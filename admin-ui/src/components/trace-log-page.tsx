@@ -11,6 +11,9 @@ import {
   Search,
   X,
   Copy,
+  Pin,
+  ArrowLeftRight,
+  Shuffle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -37,7 +40,7 @@ import {
   type TimeRange,
 } from '@/components/console/time-range'
 import { outcomeTone, railDotClass, type RailTone } from '@/components/console/rail'
-import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import type { TraceAttempt, TraceQuery, TraceRecord, UsageSource } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -122,13 +125,7 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`
 }
 
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
-}
-
-/** 千位分隔的完整数值（用于明细悬浮框） */
+/** 千位分隔的完整数值 */
 function formatTokenFull(n: number): string {
   return n.toLocaleString('en-US')
 }
@@ -141,6 +138,128 @@ function credLabel(id: number, email?: string | null): string {
 function keyLabel(keyId: number, keyName?: string | null): string {
   if (keyName) return keyName
   return `#${keyId}`
+}
+
+/** 会话 id 缩写：UUID 只留头尾，够辨认又不占地 */
+function shortSession(id: string): string {
+  if (id.length <= 14) return id
+  return `${id.slice(0, 8)}…${id.slice(-4)}`
+}
+
+/**
+ * 会话路由判定：这条请求相对该会话的上一轮，账号是沿用了还是换了。
+ *
+ * - switched：有上一轮绑定且本轮落到了不同账号 —— 上游 prompt cache 大概率作废，值得关注
+ * - hit：粘性命中，沿用上一轮账号
+ * - first：该会话此前无绑定（首轮 / 绑定过期），无从比较
+ * - off：粘性路由关闭
+ * - unknown：老记录，没有路由信息
+ */
+type RouteKind = 'switched' | 'hit' | 'first' | 'off' | 'unknown'
+
+function routeKind(rec: TraceRecord): RouteKind {
+  if (!rec.stickyOutcome) return 'unknown'
+  if (rec.stickyOutcome === 'off') return 'off'
+  const prev = rec.previousCredentialId
+  if (prev != null && prev !== rec.finalCredentialId && rec.finalCredentialId !== 0) {
+    return 'switched'
+  }
+  if (rec.stickyOutcome === 'hit') return 'hit'
+  return 'first'
+}
+
+/** 换号原因（仅 switched 时有意义） */
+function switchReason(rec: TraceRecord): string {
+  switch (rec.stickyOutcome) {
+    case 'miss_unavailable':
+      return '上一轮账号当前不可用（禁用 / 冷却 / RPM 打满 / 不支持该模型 / 不在分组）'
+    case 'hit':
+      return '粘性命中后上游失败，重试时故障转移到了其他账号'
+    default:
+      return '未知原因'
+  }
+}
+
+/**
+ * 会话粘性标记：紧跟在「最终凭据」后面的小图标。
+ * 只在需要注意的时候出声：换号用橙色，命中用绿色小图钉，其余情况不显示或灰显。
+ */
+function StickyMarker({ rec, verbose = false }: { rec: TraceRecord; verbose?: boolean }) {
+  const kind = routeKind(rec)
+  if (kind === 'unknown') return null
+
+  if (kind === 'switched') {
+    const prev = rec.previousCredentialId
+    const title = `账号切换：上一轮 #${prev} → 本轮 #${rec.finalCredentialId}\n${switchReason(rec)}\n上游 prompt cache 按账号隔离，本轮大概率冷启动`
+    return (
+      <span
+        title={title}
+        className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-500/40 bg-orange-500/10 px-1 py-px text-[10px] font-medium text-orange-600 dark:text-orange-400"
+      >
+        <ArrowLeftRight className="h-3 w-3" />
+        {verbose ? `换号 #${prev} → #${rec.finalCredentialId}` : '换号'}
+      </span>
+    )
+  }
+  if (kind === 'hit') {
+    return (
+      <span
+        title="会话粘性命中：沿用上一轮账号，上游 prompt cache 可复用"
+        className="inline-flex shrink-0 items-center gap-0.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-1 py-px text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
+      >
+        <Pin className="h-3 w-3" />
+        {verbose ? '粘性命中' : null}
+      </span>
+    )
+  }
+  if (kind === 'off') {
+    return verbose ? (
+      <span
+        title="会话粘性路由已关闭"
+        className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border/60 px-1 py-px text-[10px] text-muted-foreground"
+      >
+        <Shuffle className="h-3 w-3" />
+        粘性关闭
+      </span>
+    ) : null
+  }
+  // first：首轮或绑定过期，只在详情里说明
+  return verbose ? (
+    <span
+      title="该会话此前无账号绑定（首轮或绑定已过期），本轮按负载均衡选号"
+      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border/60 px-1 py-px text-[10px] text-muted-foreground"
+    >
+      首轮
+    </span>
+  ) : null
+}
+
+/** usage 三项来源标签：区分「上游真值」和「我们自己算的」 */
+function UsageSourceBadge({ source }: { source?: UsageSource | null }) {
+  if (!source) return null
+  const map: Record<UsageSource, { label: string; title: string; cls: string }> = {
+    provider: {
+      label: '上游真值',
+      title: 'token / cache 三项来自 Kiro metadataEvent.tokenUsage，精确',
+      cls: 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400',
+    },
+    simulated: {
+      label: '本地估算',
+      title: '上游未下发精确用量；按客户端 cache_control 断点在本地模拟缓存命中，反映的是「前缀是否稳定」而非上游真实缓存',
+      cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    },
+    none: {
+      label: '无断点',
+      title: '请求未声明 cache_control 断点或计量已关闭，全量计入输入',
+      cls: 'border-border/60 text-muted-foreground',
+    },
+  }
+  const m = map[source]
+  return (
+    <Badge variant="outline" className={`h-5 px-1.5 text-[10px] font-medium ${m.cls}`} title={m.title}>
+      {m.label}
+    </Badge>
+  )
 }
 
 const STATUS_OPTIONS = [
@@ -188,9 +307,12 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
   )
 }
 
-/** 可展开的链路行 */
-/** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
-/** Token 用量单元格：紧凑展示总量与缓存命中，hover 显示分项明细 */
+/**
+ * Token 用量单元格，两行：
+ *   `{未缓存输入} / {输出}`
+ *   `缓存↓ {缓存读取} ↑ {缓存写入}`
+ * 数字为千位分隔完整值，hover 显示带命中率的分项明细。
+ */
 function TokenCell({ rec }: { rec: TraceRecord }) {
   const input = rec.inputTokens ?? 0
   const output = rec.outputTokens ?? 0
@@ -203,7 +325,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   }
   const promptTotal = input + cacheCreation + cacheRead
   const hitRatio =
-    promptTotal > 0 && cacheRead > 0
+    promptTotal > 0
       ? (() => {
           const pct = (cacheRead / promptTotal) * 100
           if (pct >= 100) return '100'
@@ -213,34 +335,33 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
       : null
 
   const titleText = [
-    `输入 Token（未缓存）: ${formatTokenFull(input)}`,
-    cacheCreation > 0 ? `缓存写入 Token: ${formatTokenFull(cacheCreation)}` : null,
-    cacheRead > 0 ? `缓存读取 Token: ${formatTokenFull(cacheRead)} (命中率 ${hitRatio}%)` : null,
-    `输出 Token: ${formatTokenFull(output)}`,
-    `总 Token: ${formatTokenFull(total)}`,
-  ]
-    .filter(Boolean)
-    .join('\n')
+    `未缓存输入: ${formatTokenFull(input)}`,
+    `缓存写入: ${formatTokenFull(cacheCreation)}`,
+    `缓存读取: ${formatTokenFull(cacheRead)}${hitRatio != null ? `（命中率 ${hitRatio}%）` : ''}`,
+    `输出: ${formatTokenFull(output)}`,
+    `总计: ${formatTokenFull(total)}`,
+  ].join('\n')
+
+  // 与详情面板同色：缓存读取 emerald、缓存写入 amber；为 0 的分段淡化，两者皆 0 时整行淡化
+  const readClass =
+    cacheRead > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground/50'
+  const writeClass =
+    cacheCreation > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground/50'
 
   return (
     <span
-      className="inline-flex items-center gap-1.5 font-mono tabular-nums cursor-default"
+      className="console-num inline-flex flex-col text-xs leading-tight cursor-default"
       title={titleText}
     >
-      <span className="border-b border-dotted border-muted-foreground/40 text-emerald-600 dark:text-emerald-400">
-        ↓{formatTokens(promptTotal)}
+      <span className="text-foreground">
+        {formatTokenFull(input)}
+        <span className="text-muted-foreground/60"> / </span>
+        {formatTokenFull(output)}
       </span>
-      <span className="border-b border-dotted border-muted-foreground/40 text-violet-600 dark:text-violet-400">
-        ↑{formatTokens(output)}
+      <span>
+        <span className={readClass}>缓存↓ {formatTokenFull(cacheRead)}</span>{' '}
+        <span className={writeClass}>↑ {formatTokenFull(cacheCreation)}</span>
       </span>
-      {cacheRead > 0 && (
-        <Badge
-          variant="outline"
-          className="h-4 px-1 py-0 text-[10px] font-medium border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-        >
-          命中 {hitRatio}%
-        </Badge>
-      )}
     </span>
   )
 }
@@ -323,6 +444,7 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
               未命中缓存
             </Badge>
           )}
+          <UsageSourceBadge source={rec.usageSource} />
         </div>
         <div className="text-[11px] text-muted-foreground font-mono">
           总计 {formatTokenFull(total)} Token
@@ -431,7 +553,15 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
 }
 
 /** 展开折叠后的完整链路详情 */
-function TraceExpandedDetail({ rec }: { rec: TraceRecord }) {
+function TraceExpandedDetail({
+  rec,
+  onFilterSession,
+  onFilterIp,
+}: {
+  rec: TraceRecord
+  onFilterSession?: (sessionId: string) => void
+  onFilterIp?: (ip: string) => void
+}) {
   const [copied, setCopied] = useState(false)
 
   const copyTraceId = () => {
@@ -471,8 +601,37 @@ function TraceExpandedDetail({ rec }: { rec: TraceRecord }) {
         </div>
 
         <div className="ml-auto flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          <span>最终凭据: <span className="font-mono text-foreground font-medium">{credLabel(rec.finalCredentialId, rec.finalEmail)}</span></span>
+          <span className="inline-flex items-center gap-1.5">
+            最终凭据: <span className="font-mono text-foreground font-medium">{credLabel(rec.finalCredentialId, rec.finalEmail)}</span>
+            <StickyMarker rec={rec} verbose />
+          </span>
+          {rec.sessionId && (
+            <span className="inline-flex items-center gap-1">
+              会话:{' '}
+              <button
+                type="button"
+                onClick={onFilterSession ? () => onFilterSession(rec.sessionId!) : undefined}
+                title={onFilterSession ? `${rec.sessionId}\n点击只看这个会话的全部轮次` : rec.sessionId}
+                className={`font-mono text-foreground font-medium ${onFilterSession ? 'underline decoration-dotted underline-offset-2 hover:text-primary' : 'cursor-default'}`}
+              >
+                {shortSession(rec.sessionId)}
+              </button>
+            </span>
+          )}
           <span>入口 Key: <span className="font-mono text-foreground font-medium">{keyLabel(rec.keyId, rec.keyName)}</span></span>
+          {rec.clientIp && (
+            <span className="inline-flex items-center gap-1">
+              IP:{' '}
+              <button
+                type="button"
+                onClick={onFilterIp ? () => onFilterIp(rec.clientIp!) : undefined}
+                title={onFilterIp ? '点击只看这个 IP 的请求' : undefined}
+                className={`font-mono text-foreground font-medium ${onFilterIp ? 'underline decoration-dotted underline-offset-2 hover:text-primary' : 'cursor-default'}`}
+              >
+                {rec.clientIp}
+              </button>
+            </span>
+          )}
           <span>总耗时: <span className="font-mono text-foreground font-medium">{formatDuration(rec.durationMs)}</span></span>
           {rec.firstTokenMs != null && (
             <span>首 Token: <span className="font-mono text-foreground font-medium">{formatDuration(rec.firstTokenMs)}</span></span>
@@ -555,6 +714,9 @@ const URL_DEFAULTS = {
   keyId: '',
   group: '',
   q: '',
+  session: '',
+  switched: '',
+  ip: '',
   range: DEFAULT_RANGE_MINUTES,
   page: '0',
 }
@@ -630,9 +792,11 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
       {
         id: 'credential',
         header: '最终凭据',
+        hint: '绿色图钉 = 沿用上一轮账号（粘性命中）；橙色 = 与上一轮不同账号（换号，上游缓存大概率作废）',
         cell: (r) => (
-          <span className="inline-block max-w-[190px] truncate">
-            {credLabel(r.finalCredentialId, r.finalEmail)}
+          <span className="inline-flex max-w-[230px] items-center gap-1.5">
+            <span className="truncate">{credLabel(r.finalCredentialId, r.finalEmail)}</span>
+            <StickyMarker rec={r} />
           </span>
         ),
       },
@@ -645,6 +809,7 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
       {
         id: 'tokens',
         header: 'Token',
+        hint: '未缓存输入 / 输出；缓存↓读取 ↑写入',
         cell: (r) => <TokenCell rec={r} />,
       },
       {
@@ -697,6 +862,39 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
           const s = outcomeStyle(r.errorType)
           return <Badge variant={s.variant}>{s.label}</Badge>
         },
+      },
+      {
+        id: 'clientIp',
+        header: 'IP',
+        optional: true,
+        hint: '客户端 IP；反向代理后取 X-Forwarded-For / X-Real-IP，直连取 TCP 对端',
+        cell: (r) =>
+          r.clientIp ? (
+            <span className="console-num text-[11px] text-muted-foreground">{r.clientIp}</span>
+          ) : (
+            <span className="text-muted-foreground/50">—</span>
+          ),
+      },
+      {
+        id: 'session',
+        header: '会话',
+        optional: true,
+        hint: '发给上游的 conversationId，同一会话多轮共享',
+        cell: (r) =>
+          r.sessionId ? (
+            <span className="console-num text-[11px] text-muted-foreground" title={r.sessionId}>
+              {shortSession(r.sessionId)}
+            </span>
+          ) : (
+            <span className="text-muted-foreground/50">—</span>
+          ),
+      },
+      {
+        id: 'usageSource',
+        header: '用量来源',
+        optional: true,
+        hint: '上游真值 / 本地估算 / 无断点',
+        cell: (r) => <UsageSourceBadge source={r.usageSource} /> ,
       },
       {
         id: 'traceId',
@@ -757,13 +955,17 @@ export function TraceLogPage() {
     return ms == null ? undefined : Math.floor(ms / 1000)
   }, [url.range, now])
 
+  // 按会话看时不限时间：一个会话可能跨越好几个小时，不该被「最近 24h」切掉
   const query: TraceQuery = {
     status: url.status || undefined,
     errorType: url.errorType || undefined,
     keyId: url.keyId ? Number(url.keyId) : undefined,
     group: url.group || undefined,
     q: url.q || undefined,
-    startTime,
+    sessionId: url.session || undefined,
+    onlySwitched: url.switched === '1' || undefined,
+    clientIp: url.ip || undefined,
+    startTime: url.session ? undefined : startTime,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   }
@@ -772,10 +974,19 @@ export function TraceLogPage() {
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const columns = useTraceColumns()
+  const filterSession = (sessionId: string) => patchUrl({ session: sessionId, page: '0' })
+  const filterIp = (ip: string) => patchUrl({ ip, page: '0' })
 
-  const filterCount = [url.status, url.errorType, url.keyId, url.group, url.q].filter(
-    Boolean,
-  ).length
+  const filterCount = [
+    url.status,
+    url.errorType,
+    url.keyId,
+    url.group,
+    url.q,
+    url.session,
+    url.switched,
+    url.ip,
+  ].filter(Boolean).length
 
   return (
     <div className="console-scope space-y-4">
@@ -835,7 +1046,7 @@ export function TraceLogPage() {
                 e.currentTarget.blur()
               }
             }}
-            placeholder="搜索模型 / 报错 / Trace ID"
+            placeholder="搜索模型 / 报错 / Trace ID / 会话 / IP"
             aria-label="搜索日志"
             className="console-num h-8 w-[min(15rem,52vw)] rounded-md border border-border bg-card pl-8 pr-7 text-xs placeholder:font-sans placeholder:text-muted-foreground/60 focus-visible:border-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
@@ -872,6 +1083,46 @@ export function TraceLogPage() {
         />
         <Button
           size="sm"
+          variant={url.switched === '1' ? 'default' : 'outline'}
+          onClick={() => patchUrl({ switched: url.switched === '1' ? '' : '1', page: '0' })}
+          title="只看与上一轮账号不同的请求（会话换号，上游 prompt cache 大概率作废）"
+          className="gap-1.5"
+        >
+          <ArrowLeftRight className="h-3.5 w-3.5" />
+          仅换号
+        </Button>
+        {url.session && (
+          <span className="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 pl-2.5 pr-1.5 text-xs">
+            <span className="text-muted-foreground">会话</span>
+            <span className="console-num font-medium" title={url.session}>
+              {shortSession(url.session)}
+            </span>
+            <button
+              type="button"
+              onClick={() => patchUrl({ session: '', page: '0' })}
+              title="取消会话筛选"
+              className="flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        )}
+        {url.ip && (
+          <span className="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 pl-2.5 pr-1.5 text-xs">
+            <span className="text-muted-foreground">IP</span>
+            <span className="console-num font-medium">{url.ip}</span>
+            <button
+              type="button"
+              onClick={() => patchUrl({ ip: '', page: '0' })}
+              title="取消 IP 筛选"
+              className="flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        )}
+        <Button
+          size="sm"
           variant="outline"
           onClick={() => refetch()}
           disabled={isFetching}
@@ -889,7 +1140,13 @@ export function TraceLogPage() {
         selectable
         selected={selectedTraceIds}
         onSelectedChange={setSelectedTraceIds}
-        renderExpandedRow={(rec) => <TraceExpandedDetail rec={rec} />}
+        renderExpandedRow={(rec) => (
+          <TraceExpandedDetail
+            rec={rec}
+            onFilterSession={filterSession}
+            onFilterIp={filterIp}
+          />
+        )}
         expandedKeys={expandedTraceIds}
         onExpandedKeysChange={setExpandedTraceIds}
         columnsStorageKey="kiro.traces.columns"

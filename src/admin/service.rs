@@ -45,6 +45,7 @@ use super::types::{
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     CredentialMetadataSchemaConfig,
     CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
+    SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
@@ -726,30 +727,21 @@ impl AdminService {
         self
     }
 
-    /// 查询 prompt cache 计量模拟配置（含开关与实际成本折算率）。
+    /// 查询 prompt cache 计量模拟配置。
     ///
     /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
     /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致。
     pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
-        let (enabled, effective_discount_ratio) = match self.cache_meter.as_ref() {
-            Some(meter) => (meter.is_enabled(), meter.effective_discount_ratio()),
-            None => {
-                let cfg = self.token_manager.config();
-                let en = cfg
-                    .cache_metering_enabled
-                    .or_else(crate::anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
-                    .unwrap_or(true);
-                let ratio = cfg
-                    .cache_effective_discount_ratio
-                    .or_else(crate::anthropic::cache_metering::CacheMeter::discount_ratio_from_env)
-                    .unwrap_or(0.6);
-                (en, ratio)
-            }
+        let enabled = match self.cache_meter.as_ref() {
+            Some(meter) => meter.is_enabled(),
+            None => self
+                .token_manager
+                .config()
+                .cache_metering_enabled
+                .or_else(crate::anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+                .unwrap_or(true),
         };
-        CacheMeteringConfigResponse {
-            enabled,
-            effective_discount_ratio,
-        }
+        CacheMeteringConfigResponse { enabled }
     }
 
     /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
@@ -757,37 +749,20 @@ impl AdminService {
         &self,
         req: SetCacheMeteringConfigRequest,
     ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
-        if req.enabled.is_none() && req.effective_discount_ratio.is_none() {
+        let Some(enabled) = req.enabled else {
             return Err(AdminServiceError::InvalidCredential(
-                "请至少提供 enabled 或 effectiveDiscountRatio 字段".to_string(),
+                "请提供 enabled 字段".to_string(),
             ));
-        }
+        };
 
-        // 1. 处理开关
-        if let Some(enabled) = req.enabled {
-            if let Some(meter) = &self.cache_meter {
-                meter.set_enabled(enabled);
-            }
-            if let Err(e) = self
-                .token_manager
-                .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
-            {
-                tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
-            }
+        if let Some(meter) = &self.cache_meter {
+            meter.set_enabled(enabled);
         }
-
-        // 2. 处理实际成本折算率
-        if let Some(ratio) = req.effective_discount_ratio {
-            let clamped = ratio.clamp(0.1, 1.0);
-            if let Some(meter) = &self.cache_meter {
-                meter.set_effective_discount_ratio(clamped);
-            }
-            if let Err(e) = self
-                .token_manager
-                .update_config_file(|config| config.cache_effective_discount_ratio = Some(clamped))
-            {
-                tracing::warn!("持久化 prompt cache 成本折算率配置失败: {}", e);
-            }
+        if let Err(e) = self
+            .token_manager
+            .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
+        {
+            tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
         }
 
         Ok(self.get_cache_metering_config())
@@ -833,6 +808,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
+                    profile_arn: entry.profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
@@ -2397,6 +2373,36 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取会话粘性路由配置与运行时统计
+    pub fn get_session_affinity_config(&self) -> SessionAffinityConfigResponse {
+        let stats = self.token_manager.session_affinity().stats();
+        SessionAffinityConfigResponse {
+            enabled: stats.enabled,
+            ttl_secs: stats.ttl_secs,
+            hits: stats.hits,
+            misses: stats.misses,
+            active_bindings: stats.active_bindings,
+        }
+    }
+
+    /// 更新会话粘性路由配置（运行时生效 + 持久化 config.json）
+    pub fn set_session_affinity_config(
+        &self,
+        req: SetSessionAffinityConfigRequest,
+    ) -> Result<SessionAffinityConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.ttl_secs.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 ttlSecs 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_session_affinity_config(req.enabled, req.ttl_secs)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_session_affinity_config())
     }
 
     /// 获取账号级风控故障转移配置

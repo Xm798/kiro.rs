@@ -262,32 +262,43 @@ async fn main() {
 
     // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    // 计量模拟开关与实际成本折算率初始化：
-    // 折算率用于在对齐下游 NewAPI 0.1x 扣费时反向平衡 cache_read 与 input，默认 0.6（6 折成本对齐）。
     let cache_metering_enabled = config
         .cache_metering_enabled
         .or_else(anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
         .unwrap_or(true);
-    let cache_discount_ratio = config
-        .cache_effective_discount_ratio
-        .or_else(anthropic::cache_metering::CacheMeter::discount_ratio_from_env)
-        .unwrap_or(0.6);
     let cache_meter = std::sync::Arc::new(
         anthropic::cache_metering::CacheMeter::from_env(Some(
             cache_dir.join("cache_metering.json"),
         ))
         .await
-        .with_enabled(cache_metering_enabled)
-        .with_effective_discount_ratio(cache_discount_ratio),
+        .with_enabled(cache_metering_enabled),
     );
     cache_meter.clone().spawn_background();
     if !cache_metering_enabled {
         tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
     } else {
-        tracing::info!(
-            "本地 prompt cache 计量模拟已开启，实际成本等价折算率: {:.0}%",
-            cache_discount_ratio * 100.0
-        );
+        tracing::info!("本地 prompt cache 计量模拟已开启，按真实命中量上报 usage");
+    }
+
+    // 会话粘性路由：绑定表过期条目定期清理（lookup 只顺手清自己命中的那条）
+    {
+        let affinity = token_manager.session_affinity();
+        if affinity.is_enabled() {
+            tracing::info!(
+                "会话粘性路由已开启，TTL {}s：同一会话优先沿用上一轮凭据以保住上游 prompt cache",
+                affinity.ttl_secs()
+            );
+        } else {
+            tracing::info!("会话粘性路由已关闭");
+        }
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(interval).await;
+                tm.session_affinity().evict_expired();
+            }
+        });
     }
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
@@ -383,7 +394,13 @@ async fn main() {
     tracing::info!("  GET  /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// 文件不存在时初始化配置/凭证文件

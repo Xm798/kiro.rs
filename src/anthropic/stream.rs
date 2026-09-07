@@ -2705,6 +2705,16 @@ impl BufferedStreamContext {
         )
     }
 
+    /// 上游是否下发了精确 tokenUsage；配合 [`Self::cache_usage`] 推断 usage 来源。
+    pub fn has_provider_usage(&self) -> bool {
+        self.inner.provider_token_usage.is_some()
+    }
+
+    /// 本地 CacheMeter 的覆盖情况
+    pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
+        &self.inner.cache_usage
+    }
+
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
@@ -5420,7 +5430,6 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
-            effective_discount_ratio: 0.1,
         };
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
@@ -5464,7 +5473,6 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
-            effective_discount_ratio: 0.1,
         };
 
         assert_eq!(ctx.resolved_usage(), (40, 20, 20));

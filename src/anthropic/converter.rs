@@ -630,6 +630,13 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 由 conversationId 确定性派生 agentContinuationId（UUID v5，命名空间固定）。
+/// 同一会话在进程重启、多副本之间都得到同一个值。
+fn derive_agent_continuation_id(conversation_id: &str) -> String {
+    let name = format!("agent-continuation:{conversation_id}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+}
+
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -714,7 +721,11 @@ pub fn convert_request_with_mode(
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+    // agentContinuationId 从 conversationId 确定性派生，让同一会话的请求体在会话 id 之外
+    // 完全一致。实测上游 prompt cache 按内容前缀匹配、与会话 id 无关，所以这一步对缓存
+    // 没有直接收益；保留确定性只是为了请求可复现、便于排查。
+    // UUID v5 保持与此前随机 v4 相同的 36 字符格式。
+    let agent_continuation_id = derive_agent_continuation_id(&conversation_id);
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -3064,6 +3075,24 @@ mod tests {
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
         );
+
+        // agentContinuationId 由 conversationId 确定性派生：同一会话两次转换必须相同，
+        // 且保持 UUID 格式（上游按 36 字符 UUID 接受）。
+        let again = convert_request(&req).unwrap();
+        let first_acid = result.conversation_state.agent_continuation_id.clone().unwrap();
+        let second_acid = again.conversation_state.agent_continuation_id.clone().unwrap();
+        assert_eq!(first_acid, second_acid, "同一会话的 agentContinuationId 必须稳定");
+        assert!(is_valid_uuid(&first_acid));
+        assert_ne!(
+            first_acid, result.conversation_state.conversation_id,
+            "派生值不应与 conversationId 相同"
+        );
+        assert_eq!(
+            first_acid,
+            derive_agent_continuation_id("a0662283-7fd3-4399-a7eb-52b9a717ae88")
+        );
+        // 不同会话派生出不同值
+        assert_ne!(first_acid, derive_agent_continuation_id("other-session"));
     }
 
     #[test]
