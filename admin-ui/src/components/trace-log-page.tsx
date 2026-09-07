@@ -39,7 +39,12 @@ import {
   rangeToStartMs,
   type TimeRange,
 } from '@/components/console/time-range'
-import { outcomeTone, railDotClass, type RailTone } from '@/components/console/rail'
+import {
+  outcomeTone,
+  railDotClass,
+  railTextClass,
+  type RailTone,
+} from '@/components/console/rail'
 import type { TraceAttempt, TraceQuery, TraceRecord, UsageSource } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
@@ -122,7 +127,108 @@ function formatTime(ts: string): string {
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(2)}s`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`
+  const totalSec = Math.round(ms / 1000)
+  return `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`
+}
+
+/** 耗时的两种量级：首字（流式第一个 token）与总耗时（端到端），阈值各一套 */
+type LatencyKind = 'ttft' | 'total'
+
+type LatencyLevel = 'fast' | 'normal' | 'slow' | 'verySlow'
+
+/**
+ * 分档阈值（毫秒），取自本项目实测分布，不是拍脑袋的整数。
+ *
+ * 首字 TTFT —— 中位数 2~3s，正常区间 1.8~5s，偶发 20s+ 属异常：
+ *   - `<2s`    压在中位数以下：选号一次命中、上游没排队
+ *   - `2~6s`   正常。上界从实测的 5s 放宽 1s，给日常抖动留余量，免得正常请求闪黄
+ *   - `6~15s`  超出正常上界一倍以上，通常是并发排队或多走了一跳重试
+ *   - `>15s`   实测 20s+ 才确定异常，门槛提前到 15s 半档预警
+ *
+ * 总耗时 —— 短请求几秒，正常几十秒，长会话 1~2 分钟仍属正常，5 分钟以上才可疑：
+ *   - `<10s`     短请求：工具调用、单轮短回复
+ *   - `10s~2min` 正常。上界取 120s 而非直觉的 60s —— 长会话本就要跑 1~2 分钟，
+ *                按 60s 切会让日常长会话整片标黄，黄色也就失去了意义
+ *   - `2~5min`   偏长：超出常规长会话，但按实测口径还够不上可疑
+ *   - `>5min`    可疑：卡在上游、超长生成，或多次重试串联起来的累计耗时
+ */
+const LATENCY_THRESHOLDS: Record<LatencyKind, { fast: number; normal: number; slow: number }> = {
+  ttft: { fast: 2_000, normal: 6_000, slow: 15_000 },
+  total: { fast: 10_000, normal: 120_000, slow: 300_000 },
+}
+
+const LATENCY_META: Record<
+  LatencyKind,
+  { name: string; normalRange: string; reason: Record<LatencyLevel, string> }
+> = {
+  ttft: {
+    name: '首字',
+    normalRange: '正常 2-6s',
+    reason: {
+      fast: '上游响应很快',
+      normal: '',
+      slow: '可能是并发排队或上游抖动',
+      verySlow: '并发排队严重或上游抖动，值得查一下这条链路',
+    },
+  },
+  total: {
+    name: '总耗时',
+    normalRange: '正常 10s-2min',
+    reason: {
+      fast: '短请求',
+      normal: '',
+      slow: '超出常规长会话的时长',
+      verySlow: '疑似上游卡顿、超长生成，或多次重试累计',
+    },
+  },
+}
+
+const LATENCY_LEVEL_LABEL: Record<LatencyLevel, string> = {
+  fast: '快',
+  normal: '正常',
+  slow: '偏慢',
+  verySlow: '很慢',
+}
+
+function latencyLevel(ms: number, kind: LatencyKind): LatencyLevel {
+  const t = LATENCY_THRESHOLDS[kind]
+  if (ms < t.fast) return 'fast'
+  if (ms < t.normal) return 'normal'
+  if (ms < t.slow) return 'slow'
+  return 'verySlow'
+}
+
+/**
+ * 耗时数值的文字色与悬浮说明，列表单元格与展开详情共用同一套判定。
+ *
+ * 颜色直接借状态色轨的语义色（`ok` 绿 / `warn` 琥珀 / `dead` 红），异常在本页
+ * 的三处（色轨、链路节点、耗时）说的是同一种颜色语言。快与正常两档都用绿色：
+ * 绿色在这里表达「这条耗时没问题」，只有偏慢和很慢才需要被区分出来。
+ *
+ * `ms` 为 null 表示非流式请求没有首 token 时间，只占位不参与着色。
+ */
+function latencyStyle(
+  ms: number | null | undefined,
+  kind: LatencyKind,
+): { className: string; title: string } {
+  const meta = LATENCY_META[kind]
+  if (ms == null) {
+    return {
+      className: 'text-muted-foreground',
+      title: `${meta.name}：非流式请求，无首个 token 时间`,
+    }
+  }
+  const level = latencyLevel(ms, kind)
+  const className =
+    level === 'fast' || level === 'normal'
+      ? railTextClass('ok')
+      : level === 'slow'
+        ? railTextClass('warn')
+        : railTextClass('dead')
+  const reason = meta.reason[level]
+  const title = `${meta.name} ${formatDuration(ms)}：${LATENCY_LEVEL_LABEL[level]}（${meta.normalRange}）${reason ? `，${reason}` : ''}`
+  return { className, title }
 }
 
 /** 千位分隔的完整数值 */
@@ -367,6 +473,32 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
 }
 
 /**
+ * 耗时单元格，两行：`首字 {首 token 耗时}` / `总耗时 {端到端耗时}`。
+ * 非流式没有首 token，首字行显示 `—` 但保留两行结构，避免相邻行错位。
+ * 两个数值按各自量级的分档着色，慢请求在整页里直接跳出来。
+ */
+function DurationCell({ rec }: { rec: TraceRecord }) {
+  const ttft = latencyStyle(rec.firstTokenMs, 'ttft')
+  const total = latencyStyle(rec.durationMs, 'total')
+  return (
+    <span className="inline-flex flex-col text-[11px] leading-tight">
+      <span className="cursor-default whitespace-nowrap" title={ttft.title}>
+        <span className="text-[10px] text-muted-foreground/70">首字 </span>
+        <span className={`font-mono tabular-nums ${ttft.className}`}>
+          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
+        </span>
+      </span>
+      <span className="cursor-default whitespace-nowrap" title={total.title}>
+        <span className="text-[10px] text-muted-foreground/70">总耗时 </span>
+        <span className={`font-mono tabular-nums ${total.className}`}>
+          {formatDuration(rec.durationMs)}
+        </span>
+      </span>
+    </span>
+  )
+}
+
+/**
  * 故障转移轨迹（本页签名元素）：把一次请求的 attempts[] 画成横向重试链路，
  * 按每跳结果着色。单次成功只显示一个安静的圆点；重试/故障转移时展开为带凭据号
  * 的节点串，让"这次请求怎么被救回来的"一眼可读。顺序即尝试次序。
@@ -563,6 +695,8 @@ function TraceExpandedDetail({
   onFilterIp?: (ip: string) => void
 }) {
   const [copied, setCopied] = useState(false)
+  const ttft = latencyStyle(rec.firstTokenMs, 'ttft')
+  const totalDuration = latencyStyle(rec.durationMs, 'total')
 
   const copyTraceId = () => {
     navigator.clipboard.writeText(rec.traceId)
@@ -632,10 +766,20 @@ function TraceExpandedDetail({
               </button>
             </span>
           )}
-          <span>总耗时: <span className="font-mono text-foreground font-medium">{formatDuration(rec.durationMs)}</span></span>
-          {rec.firstTokenMs != null && (
-            <span>首 Token: <span className="font-mono text-foreground font-medium">{formatDuration(rec.firstTokenMs)}</span></span>
-          )}
+          <span className="inline-flex cursor-default flex-col gap-0.5" title={ttft.title}>
+            <span className="text-[10px] leading-none text-muted-foreground">首字</span>
+            <span className={`font-mono text-[13px] leading-tight font-medium ${ttft.className}`}>
+              {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
+            </span>
+          </span>
+          <span className="inline-flex cursor-default flex-col gap-0.5" title={totalDuration.title}>
+            <span className="text-[10px] leading-none text-muted-foreground">总耗时</span>
+            <span
+              className={`font-mono text-[13px] leading-tight font-medium ${totalDuration.className}`}
+            >
+              {formatDuration(rec.durationMs)}
+            </span>
+          </span>
           {rec.interruptedAfterBytes != null && (
             <span>中断已发: <span className="font-mono text-foreground font-medium">{rec.interruptedAfterBytes} 字节</span></span>
           )}
@@ -826,12 +970,8 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
       {
         id: 'duration',
         header: '耗时',
-        align: 'right',
-        cell: (r) => (
-          <span className="console-num text-muted-foreground">
-            {formatDuration(r.durationMs)}
-          </span>
-        ),
+        hint: '首字 = 首个 token 到达耗时（仅流式有值，非流式为 —）；总耗时 = 端到端。绿=正常及更快，黄=偏慢，红=很慢；两者阈值不同，悬浮数值看当前档位',
+        cell: (r) => <DurationCell rec={r} />,
       },
       {
         id: 'key',
@@ -839,18 +979,6 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         optional: true,
         cell: (r) => (
           <Badge variant="outline">{keyLabel(r.keyId, r.keyName)}</Badge>
-        ),
-      },
-      {
-        id: 'firstToken',
-        header: '首 Token',
-        optional: true,
-        align: 'right',
-        hint: '首个 token 到达耗时，仅流式有值',
-        cell: (r) => (
-          <span className="console-num text-muted-foreground">
-            {r.firstTokenMs != null ? formatDuration(r.firstTokenMs) : '—'}
-          </span>
         ),
       },
       {
