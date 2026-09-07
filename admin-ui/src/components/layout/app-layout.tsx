@@ -113,6 +113,19 @@ function GithubIcon({ className }: { className?: string }) {
   );
 }
 
+function TelegramIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M23.91 3.79 20.3 20.84c-.25 1.21-.98 1.5-2 .94l-5.5-4.07-2.66 2.57c-.3.3-.55.56-1.1.56-.72 0-.6-.27-.84-.95L6.3 13.7l-5.45-1.7c-1.18-.35-1.19-1.16.26-1.75l21.26-8.2c.97-.43 1.9.24 1.54 1.73Z" />
+    </svg>
+  );
+}
+
 interface AppLayoutProps {
   currentTab: TabKey;
   onSelectTab: (tab: TabKey, subKey?: string) => void;
@@ -436,6 +449,22 @@ export function AppLayout({
                 aria-label="GitHub 仓库"
               >
                 <GithubIcon className="size-3.5" />
+              </a>
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              asChild
+              title="Telegram 讨论群组：kiro.rs dev"
+              className="h-8 w-8 text-[#229ED9] hover:text-[#1D8FC4] hidden sm:inline-flex"
+            >
+              <a
+                href="https://t.me/+SXAjVkZDWFUyMWVl"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="Telegram 讨论群组：kiro.rs dev"
+              >
+                <TelegramIcon className="size-3.5" />
               </a>
             </Button>
             <ThemePicker
